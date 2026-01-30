@@ -27,6 +27,7 @@ from time import time
 import argparse
 import logging
 import os
+import wandb
 
 from model import DiT_models
 from utils import create_diffusion
@@ -149,6 +150,12 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        wandb.init(
+            project="diff-trial",
+            config=vars(args),
+            name=f"{experiment_index:03d}-{model_string_name}",
+            dir=experiment_dir,
+        )
     else:
         logger = create_logger(None)
 
@@ -276,6 +283,11 @@ def main(args):
                     logger.info(
                         f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}"
                     )
+                    if rank == 0:
+                        wandb.log({
+                            "train_loss": avg_loss,
+                            "steps_per_sec": steps_per_sec,
+                        }, step=train_steps)
                     # Reset monitoring variables:
                     running_loss = 0
                     log_steps = 0
@@ -293,12 +305,15 @@ def main(args):
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        wandb.log({"checkpoint_saved": train_steps}, step=train_steps)
                     dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
+    if rank == 0:
+        wandb.finish()
     cleanup()
 
 
