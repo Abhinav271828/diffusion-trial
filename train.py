@@ -284,10 +284,13 @@ def main(args):
                         f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}"
                     )
                     if rank == 0:
-                        wandb.log({
-                            "train_loss": avg_loss,
-                            "steps_per_sec": steps_per_sec,
-                        }, step=train_steps)
+                        wandb.log(
+                            {
+                                "train_loss": avg_loss,
+                                "steps_per_sec": steps_per_sec,
+                            },
+                            step=train_steps,
+                        )
                     # Reset monitoring variables:
                     running_loss = 0
                     log_steps = 0
