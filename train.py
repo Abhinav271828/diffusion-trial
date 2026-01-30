@@ -218,11 +218,19 @@ def main(args):
     running_loss = 0
     start_time = time()
 
+    # Gradient accumulation setup
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    effective_batch_size = args.global_batch_size * gradient_accumulation_steps
     logger.info(f"Training for {args.epochs} epochs...")
+    logger.info(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    logger.info(
+        f"Effective batch size: {effective_batch_size} (global_batch_size={args.global_batch_size} x accumulation={gradient_accumulation_steps})"
+    )
+
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for step, (x, y) in enumerate(loader):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
@@ -230,47 +238,62 @@ def main(args):
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
 
-            # Log loss values:
+            # Determine if this is an accumulation step (not the final one in the accumulation window)
+            is_accumulating = (step + 1) % gradient_accumulation_steps != 0
+
+            # Use no_sync context to skip gradient synchronization on intermediate accumulation steps
+            # This improves efficiency by reducing communication overhead in DDP
+            if is_accumulating:
+                with model.no_sync():
+                    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                    loss = loss_dict["loss"].mean()
+                    (loss / gradient_accumulation_steps).backward()
+            else:
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+                (loss / gradient_accumulation_steps).backward()
+                opt.step()
+                opt.zero_grad()
+                update_ema(ema, model.module)
+                train_steps += 1
+
+            # Log loss values (scale back for logging since we divided by accumulation steps)
             running_loss += loss.item()
             log_steps += 1
-            train_steps += 1
-            if train_steps % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(
-                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}"
-                )
-                # Reset monitoring variables:
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
 
-            # Save DiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args,
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+            # Only log and checkpoint after optimizer steps (not during accumulation)
+            if not is_accumulating:
+                if train_steps % args.log_every == 0:
+                    # Measure training speed:
+                    torch.cuda.synchronize()
+                    end_time = time()
+                    steps_per_sec = log_steps / (end_time - start_time)
+                    # Reduce loss history over all processes:
+                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / dist.get_world_size()
+                    logger.info(
+                        f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}"
+                    )
+                    # Reset monitoring variables:
+                    running_loss = 0
+                    log_steps = 0
+                    start_time = time()
+
+                # Save DiT checkpoint:
+                if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                    if rank == 0:
+                        checkpoint = {
+                            "model": model.module.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "args": args,
+                        }
+                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                        torch.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -291,6 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument(
         "--vae", type=str, choices=["ema", "mse"], default="ema"
